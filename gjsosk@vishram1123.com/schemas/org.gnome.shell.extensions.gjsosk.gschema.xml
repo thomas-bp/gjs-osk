@@ -86,9 +86,18 @@
 		  <default>true</default>
     </key>
     <child name="indicator" schema="org.gnome.shell.extensions.gjsosk.indicator"/>
+    <child name="status" schema="org.gnome.shell.extensions.gjsosk.status"/>
 	
   </schema>
   <schema id="org.gnome.shell.extensions.gjsosk.indicator" path="/org/gnome/shell/extensions/gjsosk/indicator/">
+  <key name="opened" type="b">
+		<default>false</default>
+	</key>
+  <key name="close" type="b">
+		<default>false</default>
+	</key>
+	</schema>
+  <schema id="org.gnome.shell.extensions.gjsosk.status" path="/org/gnome/shell/extensions/gjsosk/status/">
   <key name="opened" type="b">
 		<default>false</default>
 	</key>

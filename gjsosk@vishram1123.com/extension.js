@@ -149,6 +149,8 @@ export default class GjsOskExtension extends Extension {
         if (this.darkSchemeSettings.get_string("color-scheme") == "prefer-dark")
             this.settings.scheme = "-dark"
         this.openBit = this.settings.get_child("indicator");
+        this.statusBit = this.settings.get_child("status");
+        this.statusBit.set_boolean("opened", false);
 
         this.openPrefs = () => { this.openPreferences() }
 
@@ -231,9 +233,21 @@ export default class GjsOskExtension extends Extension {
         this._quick_settings_indicator.quickSettingsItems.push(this._toggle);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._quick_settings_indicator);
         this.open_interval();
-        this.openFromCommandHandler = this.openBit.connect("changed", () => {
+        this.openFromCommandHandler = this.openBit.connect("changed::opened", () => {
             this.openBit.set_boolean("opened", false)
-            this._toggleKeyboard();
+            if (this.Keyboard && !this.Keyboard.opened) {
+                this._openKeyboard();
+                // Mark as opened from button to prevent auto-close when using "Only on Touch" setting in fullscreen apps
+                this.Keyboard.openedFromButton = true;
+                this.Keyboard.closedFromButton = false;
+            }
+        })
+        
+        this.closeFromCommandHandler = this.openBit.connect("changed::close", () => {
+            this.openBit.set_boolean("close", false)
+            if (this.Keyboard && this.Keyboard.opened) {
+                this._closeKeyboard();
+            }
         })
         let settingsChanged = () => {
             let opened;
@@ -312,7 +326,9 @@ export default class GjsOskExtension extends Extension {
         this.inputLanguageSettings = null;
         this.gnomeKeyboardSettings = null;
         this.openBit.disconnect(this.openFromCommandHandler);
+        this.openBit.disconnect(this.closeFromCommandHandler);
         this.openBit = null;
+        this.statusBit = null;
         global.stage.disconnect(this.tapConnect)
         if (this.openInterval !== null) {
             clearInterval(this.openInterval);
@@ -344,6 +360,7 @@ class Keyboard extends Dialog {
 
     _init(settings, extensionObject) {
         this.settingsOpenFunction = extensionObject.openPrefs
+        this.extensionObject = extensionObject;
         this.inputDevice = Clutter.get_default_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         this.settings = settings;
         let monitor = Main.layoutManager.monitors[currentMonitorId];
@@ -621,7 +638,9 @@ class Keyboard extends Dialog {
                 })
             }
             this.opened = true;
-            // [insert handwriting 5]
+            if (this.extensionObject && this.extensionObject.statusBit) {
+                this.extensionObject.statusBit.set_boolean("opened", true);
+            }
         }
     }
 
@@ -639,6 +658,9 @@ class Keyboard extends Dialog {
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => {
                 this.opened = false;
+                if (this.extensionObject && this.extensionObject.statusBit) {
+                    this.extensionObject.statusBit.set_boolean("opened", false);
+                }
                 this.hide();
                 if (this.stateTimeout !== null) {
                     clearTimeout(this.stateTimeout);
