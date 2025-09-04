@@ -80,9 +80,16 @@ let extract_dir = GLib.get_user_cache_dir() + "/gjs-osk";
 
 export default class GjsOskExtension extends Extension {
     _openKeyboard(instant) {
+        // Check if physical keyboard detection is enabled and a physical keyboard is present
+        if (this.settings.get_boolean("disable-on-physical-keyboard") && this.Keyboard._hasPhysicalKeyboard()) {
+            return false;
+        }
+        
         if (this.Keyboard.state == State.CLOSED) {
             this.Keyboard.open(null, !instant ? null : true);
+            return true;
         }
+        return false;
     }
 
     _closeKeyboard(instant) {
@@ -93,6 +100,10 @@ export default class GjsOskExtension extends Extension {
 
     _toggleKeyboard(instant = false) {
         if (!this.Keyboard.opened) {
+            // Force refresh the physical keyboard cache for manual toggle
+            if (this.settings.get_boolean("disable-on-physical-keyboard") && this.Keyboard._hasPhysicalKeyboard(true)) {
+                return;
+            }
             this._openKeyboard(instant);
             this.Keyboard.openedFromButton = true;
             this.Keyboard.closedFromButton = false
@@ -116,6 +127,17 @@ export default class GjsOskExtension extends Extension {
                 }
                 this.Keyboard.get_parent().set_child_at_index(this.Keyboard, this.Keyboard.get_parent().get_n_children() - 1);
                 this.Keyboard.set_child_at_index(this.Keyboard.box, this.Keyboard.get_n_children() - 1);
+                
+                // Check if physical keyboard detection is enabled and close OSK if physical keyboard is detected
+                if (this.settings.get_boolean("disable-on-physical-keyboard") && this.Keyboard._hasPhysicalKeyboard()) {
+                    if (this.Keyboard.state === State.OPENED || this.Keyboard.state === State.OPENING) {
+                        this._closeKeyboard();
+                        this.Keyboard.openedFromButton = false;
+                        this.Keyboard.closedFromButton = true;
+                    }
+                    return;
+                }
+                
                 if (!this.Keyboard.openedFromButton && this.lastInputMethod) {
                     if (Main.inputMethod.currentFocus != null && Main.inputMethod.currentFocus.is_focused() && !this.Keyboard.closedFromButton) {
                         this._openKeyboard();
@@ -236,7 +258,11 @@ export default class GjsOskExtension extends Extension {
         this.openFromCommandHandler = this.openBit.connect("changed::opened", () => {
             this.openBit.set_boolean("opened", false)
             if (this.Keyboard && !this.Keyboard.opened) {
-                this._openKeyboard();
+                // Force refresh the physical keyboard cache for command-based opening
+                if (this.settings.get_boolean("disable-on-physical-keyboard") && this.Keyboard._hasPhysicalKeyboard(true)) {
+                    return;
+                }
+                this.Keyboard.open(null, true);
                 // Mark as opened from button to prevent auto-close when using "Only on Touch" setting in fullscreen apps
                 this.Keyboard.openedFromButton = true;
                 this.Keyboard.closedFromButton = false;
@@ -246,7 +272,7 @@ export default class GjsOskExtension extends Extension {
         this.closeFromCommandHandler = this.openBit.connect("changed::close", () => {
             this.openBit.set_boolean("close", false)
             if (this.Keyboard && this.Keyboard.opened) {
-                this._closeKeyboard();
+                this.Keyboard.close(true);
             }
         })
         let settingsChanged = () => {
@@ -388,11 +414,27 @@ class Keyboard extends Dialog {
         this.opened = false;
         this.state = State.CLOSED;
         this.delta = [];
+        this._physicalKeyboardCache = undefined;
+        this._physicalKeyboardCacheTime = 0;
         this.monitorChecker = global.backend.get_monitor_manager().connect('monitors-changed', () => {
             if (Main.layoutManager.monitors.length > 0) {
                 this.refresh();
             }
         });
+        // Listen for device changes to invalidate keyboard cache
+        try {
+            this.deviceManager = Clutter.get_default_backend().get_default_seat();
+            this.deviceAddedHandler = this.deviceManager.connect('device-added', () => {
+                this._physicalKeyboardCache = undefined;
+                this._physicalKeyboardCacheTime = 0;
+            });
+            this.deviceRemovedHandler = this.deviceManager.connect('device-removed', () => {
+                this._physicalKeyboardCache = undefined;
+                this._physicalKeyboardCacheTime = 0;
+            });
+        } catch (e) {
+            console.warn('Could not monitor device changes:', e);
+        }
         this._dragging = false;
         let side = null;
         switch (this.settings.get_int("default-snap")) {
@@ -420,12 +462,19 @@ class Keyboard extends Dialog {
             const mode = Shell.ActionMode.ALL & ~Shell.ActionMode.LOCK_SCREEN;
             const bottomDragAction = new EdgeDragAction.EdgeDragAction(side, mode);
             bottomDragAction.connect('activated', () => {
+                if (this.extensionObject.settings.get_boolean("disable-on-physical-keyboard") && this._hasPhysicalKeyboard()) {
+                    this.gestureInProgress = false;
+                    return;
+                }
                 this.open(true);
                 this.openedFromButton = true;
                 this.closedFromButton = false;
                 this.gestureInProgress = false;
             });
             bottomDragAction.connect('progress', (_action, progress) => {
+                if (this.extensionObject.settings.get_boolean("disable-on-physical-keyboard") && this._hasPhysicalKeyboard()) {
+                    return;
+                }
                 if (!this.gestureInProgress)
                     this.open(false)
                 this.setOpenState(Math.min(Math.max(0, (progress / (side % 2 == 0 ? this.box.height : this.box.width)) * 100), 100))
@@ -454,9 +503,92 @@ class Keyboard extends Dialog {
                 ac.event(e, false);
                 return true;
             } else if (ac instanceof Clutter.Text && lastInputMethod && !this.opened) {
+                if (this.settings.get_boolean("disable-on-physical-keyboard") && this._hasPhysicalKeyboard()) {
+                    return false;
+                }
                 this.open();
             }
             return false
+        }
+    }
+
+    _hasPhysicalKeyboard(forceRefresh = false) {
+        if (!forceRefresh && this._physicalKeyboardCache !== undefined && Date.now() - this._physicalKeyboardCacheTime < 5000) {
+            return this._physicalKeyboardCache;
+        }
+        
+        try {
+            // Check for physical keyboards using libinput list-devices command
+            let proc = Gio.Subprocess.new(['libinput', 'list-devices'], Gio.SubprocessFlags.STDOUT_PIPE);
+            let [, stdout, ] = proc.communicate_utf8(null, null);
+            
+            let lines = stdout.split('\n');
+            let hasPhysicalKeyboard = false;
+            
+            for (let line of lines) {
+                if (line.includes('Capabilities:') && line.includes('keyboard')) {
+                    // Found a keyboard device, check if it's not a virtual device
+                    let deviceLines = lines.slice(Math.max(0, lines.indexOf(line) - 10), lines.indexOf(line));
+                    let deviceName = '';
+                    for (let deviceLine of deviceLines) {
+                        if (deviceLine.includes('Device:')) {
+                            deviceName = deviceLine.toLowerCase();
+                            break;
+                        }
+                    }
+                    // Skip virtual keyboards, touchscreen keyboards, and on-screen keyboards
+                    if (!deviceName.includes('virtual') && 
+                        !deviceName.includes('touchscreen') && 
+                        !deviceName.includes('touch screen') &&
+                        !deviceName.includes('osk') &&
+                        !deviceName.includes('on-screen') &&
+                        !deviceName.includes('gjs-osk') &&
+                        !deviceName.includes('power button')) {
+                        hasPhysicalKeyboard = true;
+                        break;
+                    }
+                }
+            }
+            
+            this._physicalKeyboardCache = hasPhysicalKeyboard;
+            this._physicalKeyboardCacheTime = Date.now();
+            return hasPhysicalKeyboard;
+        } catch (e) {
+            // Check /proc/bus/input/devices for keyboard devices
+            try {
+                let file = Gio.File.new_for_path('/proc/bus/input/devices');
+                let [, contents] = file.load_contents(null);
+                let devicesText = new TextDecoder().decode(contents);
+                
+                // Look for keyboard handlers that aren't virtual
+                let deviceBlocks = devicesText.split('\n\n');
+                let hasPhysicalKeyboard = false;
+                
+                for (let block of deviceBlocks) {
+                    if (block.includes('Handlers=') && 
+                        (block.includes('kbd') || block.includes('event')) &&
+                        !block.toLowerCase().includes('virtual') &&
+                        !block.toLowerCase().includes('touchscreen') &&
+                        !block.toLowerCase().includes('power button')) {
+                        
+                        // Additional check for actual keyboard devices
+                        if (block.includes('EV=') && 
+                            (block.includes('120013') || block.includes('100013'))) {
+                            hasPhysicalKeyboard = true;
+                            break;
+                        }
+                    }
+                }
+                
+                this._physicalKeyboardCache = hasPhysicalKeyboard;
+                this._physicalKeyboardCacheTime = Date.now();
+                return hasPhysicalKeyboard;
+            } catch (fallbackError) {
+                console.warn('Physical keyboard detection failed:', fallbackError);
+                this._physicalKeyboardCache = false;
+                this._physicalKeyboardCacheTime = Date.now();
+                return false;
+            }
         }
     }
 
@@ -479,7 +611,13 @@ class Keyboard extends Dialog {
         }
         this.keymap.disconnect(this.capslockConnect);
         this.keymap.disconnect(this.numLockConnect);
-        global.backend.get_monitor_manager().disconnect(this.monitorChecker)
+        global.backend.get_monitor_manager().disconnect(this.monitorChecker);
+        if (this.deviceAddedHandler) {
+            this.deviceManager.disconnect(this.deviceAddedHandler);
+        }
+        if (this.deviceRemovedHandler) {
+            this.deviceManager.disconnect(this.deviceRemovedHandler);
+        }
         super.destroy();
         if (this.nonDragBlocker !== null) {
             Main.layoutManager.removeChrome(this.nonDragBlocker)

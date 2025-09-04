@@ -85,6 +85,9 @@
     <key name="show-icons" type="b">
 		  <default>true</default>
     </key>
+    <key name="disable-on-physical-keyboard" type="b">
+      <default>true</default>
+    </key>
     <child name="indicator" schema="org.gnome.shell.extensions.gjsosk.indicator"/>
     <child name="status" schema="org.gnome.shell.extensions.gjsosk.status"/>
 	
