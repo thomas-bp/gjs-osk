@@ -571,11 +571,41 @@ class Keyboard extends Dialog {
                         !block.toLowerCase().includes('touchscreen') &&
                         !block.toLowerCase().includes('power button')) {
                         
-                        // Additional check for actual keyboard devices
+                        // Check for keyboard event capabilities
+                        // EV=120013 or EV=100013 indicates keyboard capabilities
+                        // Also check for Logitech devices or other wireless receivers
                         if (block.includes('EV=') && 
-                            (block.includes('120013') || block.includes('100013'))) {
+                            (block.includes('120013') || block.includes('100013') ||
+                             block.includes('12001') || block.includes('10001'))) {
                             hasPhysicalKeyboard = true;
                             break;
+                        }
+                        
+                        // Special handling for wireless keyboards/receivers
+                        let nameMatch = block.match(/N: Name="([^"]+)"/);
+                        if (nameMatch) {
+                            let deviceName = nameMatch[1].toLowerCase();
+                            // Check for common wireless keyboard/receiver patterns
+                            if (deviceName.includes('keyboard') ||
+                                (deviceName.includes('wireless') && !deviceName.includes('mouse')) ||
+                                (deviceName.includes('bluetooth') && !deviceName.includes('mouse')) ||
+                                deviceName.includes('receiver') && !deviceName.includes('mouse') ||
+                                deviceName.includes('unifying') ||
+                                deviceName.includes('dongle')) {
+                                hasPhysicalKeyboard = true;
+                                break;
+                            }
+                        }
+                        
+                        // Additional check for HID devices that might be keyboards
+                        if (block.includes('B: KEY=') && block.includes('B: EV=')) {
+                            // Look for common keyboard key capabilities
+                            if (block.includes('10000 0 0 0') || // Basic keyboard keys
+                                block.includes('4000000 3803078 f800d001') || // Extended keyboard
+                                block.includes('fff')) { // Full keyboard range
+                                hasPhysicalKeyboard = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -584,6 +614,55 @@ class Keyboard extends Dialog {
                 this._physicalKeyboardCacheTime = Date.now();
                 return hasPhysicalKeyboard;
             } catch (fallbackError) {
+                try {
+                    let file = Gio.File.new_for_path('/sys/bus/usb/devices');
+                    if (file.query_exists(null)) {
+                        let enumerator = file.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                        let info;
+                        while ((info = enumerator.next_file(null))) {
+                            let devicePath = '/sys/bus/usb/devices/' + info.get_name();
+                            try {
+                                // Check if it's a HID keyboard interface
+                                let interfaceFile = Gio.File.new_for_path(devicePath + '/bInterfaceProtocol');
+                                if (interfaceFile.query_exists(null)) {
+                                    let [, protocolContents] = interfaceFile.load_contents(null);
+                                    let protocol = new TextDecoder().decode(protocolContents).trim();
+                                    if (protocol === '01') { // HID Boot Protocol Keyboard
+                                        this._physicalKeyboardCache = true;
+                                        this._physicalKeyboardCacheTime = Date.now();
+                                        return true;
+                                    }
+                                }
+                                
+                                // Also check for wireless receivers by examining product strings
+                                let productFile = Gio.File.new_for_path(devicePath + '/product');
+                                if (productFile.query_exists(null)) {
+                                    let [, productContents] = productFile.load_contents(null);
+                                    let productName = new TextDecoder().decode(productContents).toLowerCase().trim();
+                                    
+                                    // Check for common wireless receiver/keyboard patterns
+                                    if (productName.includes('keyboard') ||
+                                        productName.includes('receiver') ||
+                                        productName.includes('wireless') ||
+                                        productName.includes('bluetooth') ||
+                                        productName.includes('unifying') ||
+                                        productName.includes('dongle')) {
+                                        // Make sure it's not a mouse receiver
+                                        if (!productName.includes('mouse') || productName.includes('keyboard')) {
+                                            this._physicalKeyboardCache = true;
+                                            this._physicalKeyboardCacheTime = Date.now();
+                                            return true;
+                                        }
+                                    }
+                                }
+                            } catch (e) {
+                                continue;
+                            }
+                        }
+                    }
+                } catch (usbError) {
+                }
+                
                 console.warn('Physical keyboard detection failed:', fallbackError);
                 this._physicalKeyboardCache = false;
                 this._physicalKeyboardCacheTime = Date.now();
